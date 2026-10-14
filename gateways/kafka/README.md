@@ -22,9 +22,10 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > Consumer group coordination is not a stub either: `FindCoordinator`, `JoinGroup`, `Heartbeat`,
 > `LeaveGroup`, `SyncGroup`, `DescribeGroups` and `ListGroups` are real, with real membership,
 > rebalances, graceful leave, session expiry and admin views of that membership
-> ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). `kafka-consumer-groups.sh --list`,
-> `--describe --members` and `--describe --state` use those views. The default `--describe`
-> calls OffsetFetch (API key 9), which is not implemented, so that mode does not work. With the bridge off,
+> ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). `kafka-consumer-groups.sh --list` and
+> `--describe` use those views. With the bridge on, they also show a group whose consumers stopped,
+> as `Empty`, while it holds offsets. The default `--describe` then prints each committed offset
+> and its lag. With the bridge off,
 > Metadata reports every topic unknown, so a consumer joins a group and is assigned 0 partitions.
 > With the bridge on, OffsetCommit and OffsetFetch keep each group's offsets in Iggy, so a group
 > resumes from its last commit, also after a gateway restart
@@ -234,8 +235,6 @@ Limits:
 - Classic protocol only. A consumer with `group.protocol=consumer` (KIP-848) fails.
 - `group.instance.id` is accepted but not honoured. A static member that restarts causes two
   rebalances.
-- No DescribeGroups or ListGroups yet ([#3548](https://github.com/apache/iggy/issues/3548)), so
-  `kafka-consumer-groups.sh` cannot list or describe a group.
 - No DeleteGroups or OffsetDelete, and offsets never expire. An operator deletes a group's offsets
   in Iggy ([docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md#limits)).
 - Delivery is at-least-once. A consumer that stops before it commits reads those records again.

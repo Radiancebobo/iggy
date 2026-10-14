@@ -23,8 +23,8 @@
 //! across an `.await`.
 //!
 //! A group with no joined members is reported as Kafka's `Empty`. One with neither members nor
-//! pending member ids is dropped: offsets live in Iggy, so nothing here is worth keeping.
-//! TODO(#3542): keep an offsets-only group and report `Empty` once those offsets are stored here.
+//! pending member ids is dropped. Its offsets stay in Iggy, and the `ListGroups` and
+//! `DescribeGroups` handlers report it as `Empty` from there.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
@@ -39,8 +39,8 @@ use crate::group::{
     CommitRequest, DESCRIBE_RESPONSE_TOO_LARGE, GROUP_STATE_COMPLETING_REBALANCE,
     GROUP_STATE_EMPTY, GROUP_STATE_PREPARING_REBALANCE, GROUP_STATE_STABLE, GroupCoordinatorConfig,
     GroupDescription, GroupListing, GroupMember, JoinRequest, JoinResult, JoinedMember,
-    LeaveRequest, LeaveResult, LeavingMember, LeftMember, MemberDescription, SyncRequest,
-    SyncResult, owned_str,
+    LeaveRequest, LeaveResult, LeavingMember, LeftMember, MemberDescription,
+    OFFSETS_ONLY_PROTOCOL_TYPE, SyncRequest, SyncResult, owned_str,
 };
 use crate::protocol::api::{
     API_KEY_DESCRIBE_GROUPS, ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_FENCED_INSTANCE_ID,
@@ -1335,7 +1335,8 @@ pub fn leave_step(groups: &mut Groups, request: &LeaveRequest, now: Instant) -> 
 /// How one requested id is answered. Priced before [`GroupState::description`] copies blobs.
 #[derive(Clone, Copy)]
 enum DescribedChoice {
-    /// Not in the map after the tick. Encoded as `Dead`.
+    /// Not in the map after the tick. Encoded as `Empty` when the group holds offsets in Iggy,
+    /// and as `Dead` otherwise.
     Missing,
     /// `summary` is Kafka's `summaryNoMetadata` shape.
     Present { summary: bool },
@@ -1519,9 +1520,16 @@ fn too_large_described_len(version: i16, group_id: &StrBytes) -> usize {
     total
 }
 
-/// A group that is not in the map. v6 carries `GROUP_ID_NOT_FOUND` and `Group {id} not found.`;
-/// older versions encode error 0 and omit `error_message`. Matches `missing_group` in the handler.
+/// A group that is not in the map. The handler answers it after this lock is released, `Empty`
+/// when it holds offsets in Iggy and `Dead` otherwise, so it is priced as the larger answer. A
+/// `COORDINATOR_LOAD_IN_PROGRESS` answer, for when the handler cannot tell, is smaller than both.
 fn missing_described_len(version: i16, group_id: &StrBytes) -> usize {
+    dead_described_len(version, group_id).max(offsets_only_described_len(version, group_id))
+}
+
+/// v6 carries `GROUP_ID_NOT_FOUND` and `Group {id} not found.`. Older versions encode error 0 and
+/// omit `error_message`. Matches `missing_group` in the handler.
+fn dead_described_len(version: i16, group_id: &StrBytes) -> usize {
     let flexible = version >= 5;
     let mut total = 2;
     if version >= 6 {
@@ -1531,6 +1539,28 @@ fn missing_described_len(version: i16, group_id: &StrBytes) -> usize {
     total += kafka_string_len(flexible, group_id.len());
     total += kafka_string_len(flexible, "Dead".len());
     total += kafka_string_len(flexible, 0);
+    total += kafka_string_len(flexible, 0);
+    total += kafka_array_prefix(flexible, 0);
+    if version >= 3 {
+        total += 4;
+    }
+    if flexible {
+        total += 1;
+    }
+    total
+}
+
+/// Error 0 with a null v6 `error_message`, `Empty`, [`OFFSETS_ONLY_PROTOCOL_TYPE`], no protocol
+/// and no members. Matches [`GroupDescription::offsets_only`] through `described_group`.
+fn offsets_only_described_len(version: i16, group_id: &StrBytes) -> usize {
+    let flexible = version >= 5;
+    let mut total = 2;
+    if version >= 6 {
+        total += kafka_nullable_string_len(true, None);
+    }
+    total += kafka_string_len(flexible, group_id.len());
+    total += kafka_string_len(flexible, GROUP_STATE_EMPTY.len());
+    total += kafka_string_len(flexible, OFFSETS_ONLY_PROTOCOL_TYPE.len());
     total += kafka_string_len(flexible, 0);
     total += kafka_array_prefix(flexible, 0);
     if version >= 3 {
@@ -1714,6 +1744,8 @@ fn generate_member_id(group_instance_id: Option<&StrBytes>) -> StrBytes {
 
 #[cfg(test)]
 mod tests {
+    use kafka_protocol::messages::describe_groups_response::DescribedGroup;
+
     use super::*;
     use crate::protocol::handlers::describe_groups::{
         described_group, encode_response, missing_group,
@@ -2375,6 +2407,9 @@ mod tests {
         }
     }
 
+    /// A missing id is answered `Dead`, or `Empty` when it holds offsets in Iggy. One of the two
+    /// is larger for every id at a given version, `Empty` up to v5 and `Dead` at v6, where it
+    /// carries a message. So the price is the larger of the two whole responses.
     fn assert_priced_response(
         version: i16,
         groups: &mut Groups,
@@ -2384,33 +2419,67 @@ mod tests {
     ) {
         let priced = describe_frame_len(version, groups, ids, max_frame_size);
         let described = describe_groups(groups, ids, version, max_frame_size, now);
-        let encoded = encode_described(version, &dedup_first_seen(ids), &described);
+        let ids = dedup_first_seen(ids);
         let header = kafka_response_header_len(API_KEY_DESCRIBE_GROUPS, version);
+        let dead = header + encode_described(version, &ids, &described, missing_group).len();
+        let offsets_only =
+            header + encode_described(version, &ids, &described, offsets_only_group).len();
         assert_eq!(
             priced,
-            header + encoded.len(),
-            "version {version} ids {} priced {priced} encoded {}",
+            dead.max(offsets_only),
+            "version {version} ids {} priced {priced} dead {dead} offsets only {offsets_only}",
             ids.len(),
-            header + encoded.len()
         );
+    }
+
+    fn offsets_only_group(version: i16, group_id: &StrBytes) -> DescribedGroup {
+        described_group(version, GroupDescription::offsets_only(group_id.clone()))
     }
 
     fn encode_described(
         version: i16,
         ids: &[StrBytes],
         described: &[Option<GroupDescription>],
+        missing: fn(i16, &StrBytes) -> DescribedGroup,
     ) -> Bytes {
         let groups = ids
             .iter()
             .zip(described)
             .map(|(group_id, group)| {
                 group.clone().map_or_else(
-                    || missing_group(version, group_id),
+                    || missing(version, group_id),
                     |group| described_group(version, group),
                 )
             })
             .collect();
         encode_response(version, groups).expect("described group encodes")
+    }
+
+    /// Each answer to a missing id on its own, so neither hides behind the other in the maximum.
+    /// The id is past the compact varint boundary.
+    #[test]
+    fn given_a_missing_group_when_pricing_each_answer_should_match_the_encoder() {
+        let group_id = StrBytes::from_string("m".repeat(200));
+        for version in 0..=6 {
+            let header = kafka_response_header_len(API_KEY_DESCRIBE_GROUPS, version);
+            let fixed = describe_fixed_len(version, 1);
+            let encoded = |group: DescribedGroup| {
+                header
+                    + encode_response(version, vec![group])
+                        .expect("described group encodes")
+                        .len()
+            };
+            assert_eq!(
+                fixed + dead_described_len(version, &group_id),
+                encoded(missing_group(version, &group_id)),
+                "version {version} dead"
+            );
+            assert_eq!(
+                fixed + offsets_only_described_len(version, &group_id),
+                encoded(offsets_only_group(version, &group_id)),
+                "version {version} offsets only"
+            );
+        }
     }
 
     fn join_wide(groups: &mut Groups, config: &GroupCoordinatorConfig, now: Instant) -> JoinResult {

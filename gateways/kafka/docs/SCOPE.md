@@ -63,8 +63,8 @@ it knows the server supports flexible encoding.
 | 12 | Heartbeat | 0 | 4 | 0, 1, 2, 3, 4 | Refreshes a session; `REBALANCE_IN_PROGRESS` (27) drives a rejoin; flexible encoding at v4+ |
 | 13 | LeaveGroup | 0 | 5 | 0, 1, 2, 3, 4, 5 | Removes members, per-member errors from v3; flexible encoding at v4+ |
 | 14 | SyncGroup | 0 | 5 | 0, 1, 2, 3, 4, 5 | Relays the leader's assignment blobs; flexible encoding at v4+ |
-| 15 | DescribeGroups | 0 | 6 | 0, 1, 2, 3, 4, 5, 6 | Members, assignment and state of groups on this coordinator; a missing group is `Dead`, and v6 also returns `GROUP_ID_NOT_FOUND` (69); flexible encoding at v5+ |
-| 16 | ListGroups | 0 | 5 | 0, 1, 2, 3, 4, 5 | Groups on this coordinator; v4+ state filter and v5 type filter; flexible encoding at v3+ |
+| 15 | DescribeGroups | 0 | 6 | 0, 1, 2, 3, 4, 5, 6 | Members, assignment and state of groups on this coordinator. A group that is not there but holds offsets in Iggy is `Empty`. Any other missing group is `Dead`, and v6 also returns `GROUP_ID_NOT_FOUND` (69). Flexible encoding at v5+ |
+| 16 | ListGroups | 0 | 5 | 0, 1, 2, 3, 4, 5 | Groups on this coordinator, plus the groups that hold offsets in Iggy as `Empty` (see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)). v4+ state filter and v5 type filter. Flexible encoding at v3+ |
 | 22 | InitProducerId | 0 | 5 | 0, 1, 2, 3, 4, 5 | Allocate a producer id (epoch 0); a `transactional_id` gets `UNSUPPORTED_VERSION` (35); flexible encoding at v2+ |
 | 32 | DescribeConfigs | 1 | 4 | 1, 2, 3, 4 | Topic resources only. Returns `retention.ms` and `cleanup.policy`. Flexible encoding at v4. See [`CONFIGS.md`](CONFIGS.md) |
 | 33 | AlterConfigs | 0 | 2 | 0, 1, 2 | Persists `retention.ms` only. Flexible encoding at v2. See [`CONFIGS.md`](CONFIGS.md) |

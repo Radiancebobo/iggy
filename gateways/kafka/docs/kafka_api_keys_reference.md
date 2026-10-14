@@ -92,7 +92,8 @@ Key new minimums:
 | 16 | **ListGroups** | 1 | 5 | v3 | Implemented |
 | 42 | **DeleteGroups** | 1 | 2 | v2 | 🟡 Optional Stub |
 
-> DescribeGroups and ListGroups are implemented. They read this coordinator's in-memory groups.
+> DescribeGroups and ListGroups are implemented. They read this coordinator's in-memory groups, and
+> report a group that only holds offsets in Iggy as `Empty`.
 > See [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md).
 
 ---

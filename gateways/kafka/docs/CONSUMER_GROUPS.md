@@ -14,8 +14,8 @@ in Iggy ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)).
 | 12 | Heartbeat | 0-4 | Refreshes a session; `REBALANCE_IN_PROGRESS` is how a follower learns to rejoin |
 | 13 | LeaveGroup | 0-5 | Removes members; survivors' parked joins and syncs are released at once |
 | 14 | SyncGroup | 0-5 | Relays the leader's assignment blobs; a follower parks until the leader syncs |
-| 15 | DescribeGroups | 0-6 | Members, assignment and state. A group that is not here is `Dead`; v6 also returns `GROUP_ID_NOT_FOUND` (69) |
-| 16 | ListGroups | 0-5 | Groups currently on this coordinator. v4+ can filter by state, v5 by type `classic` |
+| 15 | DescribeGroups | 0-6 | Members, assignment and state. A group that is not here but holds offsets in Iggy is `Empty`. Otherwise it is `Dead`, and v6 also returns `GROUP_ID_NOT_FOUND` (69) |
+| 16 | ListGroups | 0-5 | Groups currently on this coordinator, plus the groups that hold offsets in Iggy as `Empty`. v4+ can filter by state, v5 by type `classic` |
 
 `kafka-protocol` can encode FindCoordinator v5 and v6 as well, and they are byte-identical to v4.
 They are not advertised because `SCOPE.md`'s governance model only admits a version once it has
@@ -25,16 +25,14 @@ been manually tested.
 
 `DescribeGroups` and `ListGroups` read the same in-memory map the join path writes. State strings
 are `Empty`, `PreparingRebalance`, `CompletingRebalance` and `Stable`. `Empty` means the group
-has no joined members: a v4+ client has been handed a member id and has not rejoined with it yet.
-`Dead` is only the describe answer for an id that is not in the map.
-
-A group with neither members nor pending member ids is removed. Kafka keeps an `Empty` group
-that only has committed offsets. Offsets are not stored here yet.
-TODO(#3542): once offset storage lands, keep those groups and report `Empty`.
+has no joined members. Either a v4+ client got a member id and did not rejoin with it yet, or
+the group only holds offsets
+([below](#groups-that-only-hold-offsets)). `Dead` is only the describe answer for an id
+that is not in the map and holds no offsets.
 
 `ListGroups` does not tick. It leaves sessions, pending ids and phases untouched, and it omits a
 group whose member sessions and pending-id deadlines are all already past. `DescribeGroups` does
-tick each named group, so that same id is then `Dead`.
+tick each named group, so that same id is then `Dead`, or `Empty` for a group that holds offsets.
 
 While a group is not `Stable`, `DescribeGroups` leaves `protocol_data`, member metadata and
 member assignment empty. Kafka does the same: during `PreparingRebalance` the stored assignment
@@ -48,13 +46,44 @@ second snapshot of the same members would otherwise multiply the encoded respons
 count.
 
 `kafka-consumer-groups.sh --list`, `--describe --members` and `--describe --state` use these
-two APIs. The default `--describe` calls `OffsetFetch` (API key 9), which is not implemented,
-so that mode does not work. `--reset-offsets` needs the same API.
+two APIs. With a bridge, the default `--describe` also reads each committed offset with
+`OffsetFetch` (9) and each end offset with `ListOffsets` (2), and prints the lag.
+`--reset-offsets` writes the new offsets with `OffsetCommit` (8). Both work for a group whose
+consumers stopped, because that group is `Empty` while it holds offsets.
 
 Member `client_id` and `client_host` are empty. The coordinator does not keep the request
 header's client id or the connection's peer address. `include_authorized_operations` is answered
 with the omitted sentinel. There is no group ACL bitfield. `ListGroups` v5 sets `group_type` to
 `classic`, which is the only protocol this coordinator runs.
+
+## Groups that only hold offsets
+
+A group with neither members nor pending member ids is removed from the map. Its offsets stay in
+Iggy, and Kafka keeps such a group and reports it as `Empty`. So both APIs also report each group
+that holds offsets in Iggy and has no members here. Such a group is `Empty`, with protocol type
+`consumer` and no members. Iggy stores no protocol type. Kafka keeps `consumer` for a group whose
+consumers left, and the Java admin client takes `consumer` or an empty type as a consumer group.
+
+The gateway finds these groups with a scan. A scan lists the Kafka topics, then calls
+`get_consumer_groups` once per topic and keeps the Iggy groups named `kafka.cg.<group>`
+([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)). It runs on the offset read slots, so it never waits
+behind Produce. One scan answers every request for 10 seconds, because kafka-ui lists groups every
+30 seconds and a scan costs one Iggy call per topic. At most one scan runs at a time, and a request
+that comes while it runs waits for it. A commit through this gateway adds its group at once, so a
+new group does not wait for the next scan. A group that another gateway created appears with the
+next scan.
+
+A request waits for a scan until its offset deadline, 3 seconds by default. The scan keeps running
+after that, for up to 30 seconds, and serves the next request. If a scan fails, the groups of the
+last scan that found them stay the answer. If no scan has found them yet, `ListGroups` answers
+`COORDINATOR_LOAD_IN_PROGRESS` (14), and `DescribeGroups` answers 14 for each named group that is
+not in the map. The Java admin client retries that code. A `ListGroups` state filter without
+`Empty`, or a type filter without `classic`, needs no scan. `DescribeGroups` scans only for a named
+group that is not in the map.
+
+A negative commit deletes an offset but not the Iggy group. So a group whose offsets were all
+deleted that way still shows as `Empty`. Without a bridge, no group holds offsets, and both APIs
+report only the groups in the map.
 
 ## Assignment is the client's job
 
@@ -120,12 +149,13 @@ survivors keep the current generation and learn about the rebalance through
 `REBALANCE_IN_PROGRESS` (27) on their next heartbeat, which the Java client handles as a graceful
 rejoin rather than as lost partitions.
 
-When a group empties, by leave or by expiry, it is dropped, so the next group under that name
-starts again at generation 1. The pending-member-id window above is the one case that stays and
-reports `Empty`. Kafka also keeps an `Empty` group that only has committed offsets, and its
-generation with it. This coordinator does not, until offset storage lands (#3542). This is
-safe because member ids carry a UUID and every generation check is preceded by a membership
-check, so a stale client is told `UNKNOWN_MEMBER_ID` before its generation is ever compared.
+When a group empties, by leave or by expiry, it is dropped, so the next group under that name starts
+again at generation 1. The pending-member-id window above is the one case that stays and reports
+`Empty`. Kafka also keeps an `Empty` group that only holds committed offsets, and its generation
+with it. This gateway reports that group as `Empty` from its offsets in Iggy ([Groups that only hold
+offsets](#groups-that-only-hold-offsets)), but keeps no generation for it. This is safe because
+member ids carry a UUID and every generation check is preceded by a membership check. So a stale
+client is told `UNKNOWN_MEMBER_ID` before its generation is ever compared.
 
 ## Leaving a group
 

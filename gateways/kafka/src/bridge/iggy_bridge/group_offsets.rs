@@ -17,9 +17,11 @@
 
 //! Kafka group offsets, kept as Iggy external group offsets. See `docs/OFFSET_STORAGE.md`.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::future::join_all;
 use iggy::prelude::{
@@ -27,16 +29,23 @@ use iggy::prelude::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, timeout, timeout_at};
-use tracing::info;
+use tracing::{debug, info};
 
 use super::{
-    IggyBridge, KafkaTopicMetadata, LazyClient, SLOT_LIMIT, TopicTarget, in_slot, permit_by,
+    IggyBridge, KafkaTopicMetadata, LazyClient, OffsetGroups, SLOT_LIMIT, TopicTarget, in_slot,
+    permit_by,
 };
 use crate::bridge::error::BridgeError;
+use crate::group::is_valid_group_id;
+use crate::protocol::api::ERROR_UNKNOWN_TOPIC_OR_PARTITION;
 
 /// Prefix of the Iggy consumer group that holds a Kafka group's offsets. It keeps a Kafka group
 /// apart from a native Iggy group of the same name.
 pub const OFFSET_GROUP_PREFIX: &str = "kafka.cg.";
+
+/// How long one scan for the groups that hold offsets may take. It keeps running after the request
+/// that started it stops waiting.
+const GROUP_SCAN_LIMIT: Duration = Duration::from_secs(30);
 
 /// Offset calls that run at once, each slot on clients of its own, so offset calls never wait
 /// behind a Produce send.
@@ -90,7 +99,8 @@ impl IggyBridge {
     /// store that finds no Iggy group for the offsets creates it. A replay that Iggy already
     /// applied counts as done.
     ///
-    /// Commits on one slot start one at a time, in the order given.
+    /// Commits on one slot start one at a time, in the order given. A stored offset adds `group`
+    /// to [`Self::offset_groups`] at once.
     ///
     /// # Errors
     ///
@@ -109,7 +119,7 @@ impl IggyBridge {
         };
         // `join_all` polls each call once, in order, before any again, so calls on one slot
         // queue for it in order.
-        join_all(commits.iter().map(|&(topic, partition, offset)| {
+        let results = join_all(commits.iter().map(|&(topic, partition, offset)| {
             let (names, stream_id, topic_id) = (
                 Arc::clone(&names),
                 topic.stream_id.clone(),
@@ -120,7 +130,15 @@ impl IggyBridge {
             };
             self.commit_in_slot(slot_of(topic, partition), calls, commit)
         }))
-        .await
+        .await;
+        let stored = commits
+            .iter()
+            .zip(&results)
+            .any(|(&(_, _, offset), result)| offset >= 0 && result.is_ok());
+        if stored {
+            self.group_index.note(group);
+        }
+        results
     }
 
     /// The committed offset of Kafka group `group` for each `(topic, partition)` of `reads`, in
@@ -198,6 +216,75 @@ impl IggyBridge {
         let listing =
             |client: Arc<IggyClient>| async move { self.list_kafka_topics_on(&client).await };
         self.read_in_slot(LISTING_SLOT, calls, listing).await
+    }
+
+    /// The Kafka groups that hold offsets in Iggy, from a scan that began less than 10 s ago, plus
+    /// the groups that this gateway stored offsets for since. A scan lists the Kafka topics, then
+    /// the Iggy groups of each topic on the offset read slots, so it costs one call per topic.
+    ///
+    /// Callers that come while a scan runs wait for it, until `deadline`. The scan keeps running
+    /// after that and serves the next caller. A scan that fails, or does not end in time, leaves
+    /// the groups of the last scan that found them as the answer. `None` when no scan found them
+    /// yet.
+    pub async fn offset_groups(self: &Arc<Self>, deadline: Instant) -> Option<Arc<OffsetGroups>> {
+        let bridge = Arc::clone(self);
+        let scan = move || async move {
+            let calls = OffsetCalls::new(Instant::now() + GROUP_SCAN_LIMIT);
+            bridge.scan_offset_groups(&calls).await
+        };
+        self.group_index.groups(deadline, scan).await
+    }
+
+    /// Every Kafka group with offsets on a Kafka topic. A topic deleted since the listing holds
+    /// none, and so does one the bridge user may not read.
+    async fn scan_offset_groups(
+        &self,
+        calls: &OffsetCalls,
+    ) -> Result<BTreeSet<String>, BridgeError> {
+        let topics = self.list_kafka_topics_in_slot(calls).await?;
+        let listings = join_all(
+            topics
+                .iter()
+                .map(|topic| self.offset_groups_on(&topic.kafka_topic, calls)),
+        )
+        .await;
+        let mut groups = BTreeSet::new();
+        for (topic, listing) in topics.iter().zip(listings) {
+            match listing {
+                Ok(found) => groups.extend(found),
+                Err(BridgeError::Iggy(IggyError::Unauthorized)) => {
+                    debug!(
+                        topic = topic.kafka_topic.as_str(),
+                        "skipping a topic the bridge user may not read in the scan for groups"
+                    );
+                }
+                Err(error) if error.to_kafka_error_code() == ERROR_UNKNOWN_TOPIC_OR_PARTITION => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(groups)
+    }
+
+    /// The Kafka groups with offsets on `kafka_topic`.
+    async fn offset_groups_on(
+        &self,
+        kafka_topic: &str,
+        calls: &OffsetCalls,
+    ) -> Result<Vec<String>, BridgeError> {
+        let topic = self.topic_target(kafka_topic)?;
+        // Any slot will do. Partition 0's spreads the topics over the slots.
+        let slot = slot_of(&topic, 0);
+        let listing = |client: Arc<IggyClient>| async move {
+            let groups = client
+                .get_consumer_groups(&topic.stream_id, &topic.topic_id)
+                .await
+                .map_err(BridgeError::Iggy)?;
+            Ok(groups
+                .iter()
+                .filter_map(|group| kafka_group_of(&group.name))
+                .collect())
+        };
+        self.read_in_slot(slot, calls, listing).await
     }
 
     /// Runs `call` with the commit client of `slot`, and waits for it until the deadline of
@@ -334,6 +421,13 @@ impl OffsetNames {
             consumer: Consumer::external_group(id),
         })
     }
+}
+
+/// The Kafka group whose offsets the Iggy group `name` holds. `None` for any other Iggy group.
+fn kafka_group_of(name: &str) -> Option<String> {
+    name.strip_prefix(OFFSET_GROUP_PREFIX)
+        .filter(|group| is_valid_group_id(group))
+        .map(str::to_owned)
 }
 
 /// One commit on `client`. A store that finds no Iggy group creates it and stores again.
@@ -479,6 +573,13 @@ mod tests {
             matches!(commit, Err(BridgeError::Timeout)),
             "the caller gives up"
         );
+    }
+
+    #[test]
+    fn given_an_iggy_group_name_only_an_offset_group_should_name_a_kafka_group() {
+        assert_eq!(kafka_group_of("kafka.cg.orders").as_deref(), Some("orders"));
+        assert_eq!(kafka_group_of("orders"), None, "a native Iggy group");
+        assert_eq!(kafka_group_of("kafka.cg."), None, "an empty Kafka group id");
     }
 
     #[test]

@@ -127,8 +127,10 @@ pub async fn dispatch(
         API_KEY_HEARTBEAT => heartbeat::handle(state, connection, api_version, body).await,
         API_KEY_LEAVE_GROUP => leave_group::handle(state, api_version, body).await,
         API_KEY_SYNC_GROUP => sync_group::handle(state, api_version, body).await,
-        API_KEY_DESCRIBE_GROUPS => describe_groups::handle(state, api_version, body).await,
-        API_KEY_LIST_GROUPS => list_groups::handle(state, api_version, body).await,
+        API_KEY_DESCRIBE_GROUPS => {
+            describe_groups::handle(state, connection, api_version, body).await
+        }
+        API_KEY_LIST_GROUPS => list_groups::handle(state, connection, api_version, body).await,
         API_KEY_INIT_PRODUCER_ID => init_producer_id::handle(state, api_version, body).await,
         _ => HandleOutcome::Close,
     }

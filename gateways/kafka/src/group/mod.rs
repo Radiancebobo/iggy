@@ -53,6 +53,13 @@ pub const GROUP_STATE_COMPLETING_REBALANCE: &str = "CompletingRebalance";
 /// `DescribeGroups` / `ListGroups` state string for a group whose assignment is in effect.
 pub const GROUP_STATE_STABLE: &str = "Stable";
 
+/// Protocol type of a group that only holds offsets in Iggy.
+///
+/// Kafka keeps `consumer` for a group whose consumers left, and Iggy stores no protocol type to say
+/// otherwise. Kafka's admin client takes a group as a consumer group with `consumer` or an empty
+/// type.
+pub const OFFSETS_ONLY_PROTOCOL_TYPE: &str = "consumer";
+
 /// v6 `error_message` when one `DescribeGroups` group does not fit the response budget.
 ///
 /// `UNKNOWN_SERVER_ERROR` is not retried by `kafka-consumer-groups.sh`, so the tool prints this
@@ -358,6 +365,19 @@ pub struct GroupListing {
     pub state: &'static str,
 }
 
+impl GroupListing {
+    /// A group with no members here that holds offsets in Iggy. Kafka keeps a group whose
+    /// consumers left, and lists it as `Empty`.
+    #[must_use]
+    pub const fn offsets_only(group_id: StrBytes) -> Self {
+        Self {
+            group_id,
+            protocol_type: StrBytes::from_static_str(OFFSETS_ONLY_PROTOCOL_TYPE),
+            state: GROUP_STATE_EMPTY,
+        }
+    }
+}
+
 /// One group the coordinator currently holds, as `DescribeGroups` reports it.
 #[derive(Debug, Clone)]
 pub struct GroupDescription {
@@ -372,6 +392,22 @@ pub struct GroupDescription {
     /// described without member metadata.
     pub protocol_name: Option<StrBytes>,
     pub members: Vec<MemberDescription>,
+}
+
+impl GroupDescription {
+    /// [`GroupListing::offsets_only`] as `DescribeGroups` reports it: `Empty`, with no protocol
+    /// and no members.
+    #[must_use]
+    pub const fn offsets_only(group_id: StrBytes) -> Self {
+        Self {
+            group_id,
+            error: ERROR_NONE,
+            state: GROUP_STATE_EMPTY,
+            protocol_type: StrBytes::from_static_str(OFFSETS_ONLY_PROTOCOL_TYPE),
+            protocol_name: None,
+            members: Vec::new(),
+        }
+    }
 }
 
 /// The answer for one `LeavingMember`.
